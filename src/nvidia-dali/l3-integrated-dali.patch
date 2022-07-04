@@ -1,0 +1,629 @@
+diff --git a/dali/image/generic_image.cc b/dali/image/generic_image.cc
+index 621f8060..3e677877 100644
+--- a/dali/image/generic_image.cc
++++ b/dali/image/generic_image.cc
+@@ -14,6 +14,7 @@
+ 
+ #include "dali/image/generic_image.h"
+ #include "dali/image/png.h"
++#include "dali/image/l3.h"
+ #include "dali/util/ocv.h"
+ 
+ namespace dali {
+diff --git a/dali/image/image_factory.cc b/dali/image/image_factory.cc
+index 8276ece4..1e09d530 100644
+--- a/dali/image/image_factory.cc
++++ b/dali/image/image_factory.cc
+@@ -24,6 +24,7 @@
+ #include "dali/image/tiff.h"
+ #endif
+ #include "dali/image/pnm.h"
++#include "dali/image/l3.h"
+ 
+ namespace dali {
+ 
+@@ -85,7 +86,7 @@ ImageFactory::CreateImage(const uint8_t *encoded_image, size_t length, DALIImage
+   DALI_ENFORCE(CheckIsPNG(encoded_image, length) + CheckIsBMP(encoded_image, length) +
+                CheckIsGIF(encoded_image, length) + CheckIsJPEG(encoded_image, length) +
+                CheckIsTiff(encoded_image, length) + CheckIsPNM(encoded_image, length) +
+-               CheckIsJPEG2k(encoded_image, length) == 1,
++               CheckIsJPEG2k(encoded_image, length) + CheckIsL3Image(encoded_image, length) == 1,
+                "Encoded image has ambiguous format");
+   if (CheckIsPNG(encoded_image, length)) {
+     return std::make_unique<PngImage>(encoded_image, length, image_type);
+@@ -105,6 +106,8 @@ ImageFactory::CreateImage(const uint8_t *encoded_image, size_t length, DALIImage
+ #else
+     return std::make_unique<TiffImage>(encoded_image, length, image_type);
+ #endif
++  } else if (CheckIsL3Image(encoded_image, length)) {
++    return std::make_unique<L3Image>(encoded_image, length, image_type);
+   }
+   return std::make_unique<GenericImage>(encoded_image, length, image_type);
+ }
+diff --git a/dali/image/l3.cc b/dali/image/l3.cc
+new file mode 100644
+index 00000000..6ce1c5a4
+--- /dev/null
++++ b/dali/image/l3.cc
+@@ -0,0 +1,48 @@
++
++#include "dali/image/l3.h"
++#include "dali/core/byte_io.h"
++
++namespace dali {
++
++namespace {
++
++constexpr int kOffsetWidth = sizeof(uint32_t);
++constexpr int kOffsetHeight = kOffsetWidth + sizeof(uint32_t);
++
++uint32_t ReadHeight(const uint8_t *data) {
++  return ReadValueLE<uint32_t>(data + kOffsetHeight);
++}
++
++uint32_t ReadWidth(const uint8_t *data) {
++  return ReadValueLE<uint32_t>(data + kOffsetWidth);
++}
++
++}  // namespace
++
++
++bool CheckIsL3Image(const uint8_t *l3image, int size) {
++  return ((size > 4) && (l3image[0] == 'L') && (l3image[1] == 'L') &&
++          (l3image[2] == 'L') && (l3image[3] == '.'));
++}
++
++
++L3Image::L3Image(const uint8_t *encoded_buffer, size_t length, DALIImageType image_type) :
++        GenericImage(encoded_buffer, length, image_type) {
++}
++
++
++Image::Shape L3Image::PeekShapeImpl(const uint8_t *encoded_buffer, size_t length) const {
++  DALI_ENFORCE(encoded_buffer);
++  DALI_ENFORCE(length >= 16);
++
++  const int64_t W = ReadWidth(encoded_buffer);
++  const int64_t H = ReadHeight(encoded_buffer);
++
++  // L3 currently only support RGB channel format image
++  const int64_t C = 3;
++  return {H, W, C};
++}
++
++
++}  // namespace dali
++
+diff --git a/dali/image/l3.h b/dali/image/l3.h
+new file mode 100644
+index 00000000..679fafe2
+--- /dev/null
++++ b/dali/image/l3.h
+@@ -0,0 +1,28 @@
++
++#ifndef DALI_IMAGE_L3_H_
++#define DALI_IMAGE_L3_H_
++
++#include "dali/core/common.h"
++#include "dali/image/generic_image.h"
++
++namespace dali {
++
++bool CheckIsL3Image(const uint8_t *l3image, int size);
++
++/**
++ * New lightweight lossless image decoding is performed using OpenCV, thus it's the same as Generic decoding
++ */
++class L3Image final : public GenericImage {
++ public:
++  L3Image(const uint8_t *encoded_buffer, size_t length, DALIImageType image_type);
++
++  ~L3Image() override = default;
++
++ private:
++  Shape PeekShapeImpl(const uint8_t *encoded_buffer, size_t length) const override;
++};
++
++}  // namespace dali
++
++#endif  // DALI_IMAGE_L3_H_
++
+diff --git a/dali/operators/decoder/nvjpeg/l3_decoder.cu b/dali/operators/decoder/nvjpeg/l3_decoder.cu
+new file mode 100644
+index 00000000..3ce30302
+--- /dev/null
++++ b/dali/operators/decoder/nvjpeg/l3_decoder.cu
+@@ -0,0 +1,232 @@
++
++#include "dali/operators/decoder/nvjpeg/l3_decoder.h"
++#include "dali/core/error_handling.h"
++#include "dali/core/byte_io.h"
++
++
++namespace dali {
++
++namespace {
++
++
++constexpr int kOffsetWidth = sizeof(int);
++constexpr int kOffsetHeight = kOffsetWidth + sizeof(int);
++
++/*
++constexpr int kOffsetShard = kOffsetHeight + sizeof(int);
++
++char ReadShard(const uint8_t *data) {
++  return ReadValueLE<char>(data + kOffsetShard);
++}
++*/
++
++int ReadHeight(const uint8_t *data) {
++  return ReadValueLE<int>(data + kOffsetHeight);
++}
++
++int ReadWidth(const uint8_t *data) {
++  return ReadValueLE<int>(data + kOffsetWidth);
++}
++
++}  // namespace
++
++
++__device__ inline char paeth_filter(unsigned char a, unsigned char b, unsigned char c) {
++
++    int p = (int)(a + c - b);
++
++    if (a == 0) {
++        int pb = abs(p - b);
++        int pc = abs(p - c);
++
++        if (pb <= pc) return b;
++        else          return c;
++    } else if (c == 0) {
++        int pa = abs(p - a);
++        int pb = abs(p - b);
++
++        if (pa <= pb) return a;
++        else          return b;
++
++    } else {
++        int pa = abs(p - a);
++        int pb = abs(p - b);
++        int pc = abs(p - c);
++
++        if (pa <= pb && pa <= pc) return a;
++        else if (pa <= pc)        return b;
++        else                      return c;
++    }
++
++    return -1;
++}
++
++
++__device__ int bd_loop_dec(unsigned char* bd, char* paeth) {
++    int nbit_entry = (bd[0] & 0x0F);
++    char base = ((bd[0] & 0xF0) >> 4) + ((bd[1] & 0x0F) << 4);
++
++    int sbit = 12 + threadIdx.x * nbit_entry;
++    int ebit = 12 + (threadIdx.x + 1) * nbit_entry - 1;
++
++    int sbound = floorf(sbit / 8);
++    int ebound = floorf(ebit / 8);
++
++    int sstart = sbit - sbound * 8;
++    int estart = ebit - ebound * 8;
++
++    if (sbound == ebound) {
++        unsigned char flag = 0;
++        for (int j = 0; j < nbit_entry; j++) {
++            flag += (1 << j);
++        }
++        flag = flag << sstart;
++        paeth[threadIdx.x] = ((bd[sbound] & flag) >> sstart) + base;
++    } else {
++        int nbit_entry_a = 8 - sstart;
++        int nbit_entry_b = estart + 1;
++
++        unsigned char flag_a = 0;
++        for (int j = 0; j < nbit_entry_a; j++) {
++            flag_a += ((unsigned char)128 >> j);
++        }
++
++        unsigned char flag_b = 0;
++        for (int j = 0; j < nbit_entry_b; j++) {
++            flag_b += (1 << j);
++        }
++
++        paeth[threadIdx.x] = ((bd[sbound] & flag_a) >> sstart) + ((bd[ebound] & flag_b) << nbit_entry_a) + base;
++    }
++
++    return (int)roundf((12 + nbit_entry * 64) / 8 + 0.5);
++}
++
++
++__device__ void paeth_loop_dec(char* paeth, int i, int idx, unsigned char* unpack, int wd) {
++    if (i == 0) {
++        unpack[idx + 3 * threadIdx.x] = paeth[threadIdx.x];
++    } else {
++        if (threadIdx.x == 0) {
++            unpack[idx + 3 * threadIdx.x] = paeth[threadIdx.x] + paeth_filter(0,
++                                                                        unpack[idx + 3 * (threadIdx.x - wd)],
++                                                                        unpack[idx + 3 * (threadIdx.x - wd + 1)]);
++        } else if (threadIdx.x == (shard - 1)) {
++            unpack[idx + 3 * threadIdx.x] = paeth[threadIdx.x] + paeth_filter(unpack[idx + 3 * (threadIdx.x - wd - 1)],
++                                                                        unpack[idx + 3 * (threadIdx.x - wd)],
++                                                                        0);
++        } else {
++            unpack[idx + 3 * threadIdx.x] = paeth[threadIdx.x] + paeth_filter(unpack[idx + 3 * (threadIdx.x - wd - 1)],
++                                                                        unpack[idx + 3 * (threadIdx.x - wd)],
++                                                                        unpack[idx + 3 * (threadIdx.x - wd + 1)]);
++        }
++    }
++}
++
++
++__global__ void decoder(unsigned char* input, int* offset_r, int* offset_g, int* offset_b,  unsigned char* output,
++                        int wd, int ht, int num_wd, int num_ht) {
++    int offset_idx = blockIdx.y * num_wd + blockIdx.x;
++
++    int header_size = sizeof(short) * (num_wd * num_ht * 3) + 13;
++
++    int pt_offset_r = offset_r[offset_idx] + header_size;
++    int pt_offset_g = offset_g[offset_idx] + header_size + offset_r[num_wd * num_ht];
++    int pt_offset_b = offset_b[offset_idx] + header_size + offset_r[num_wd * num_ht] + offset_g[num_wd * num_ht];
++
++    char paeth_r[shard], paeth_g[shard], paeth_b[shard];
++
++    for (int i = 0; i < shard; i++) {
++        memset(paeth_r, 0, sizeof(char) * shard);
++        memset(paeth_g, 0, sizeof(char) * shard);
++        memset(paeth_b, 0, sizeof(char) * shard);
++
++        int row_off_r = bd_loop_dec(&input[pt_offset_r], paeth_r);
++        int row_off_g = bd_loop_dec(&input[pt_offset_g], paeth_g);
++        int row_off_b = bd_loop_dec(&input[pt_offset_b], paeth_b);
++
++        pt_offset_r += row_off_r;
++        pt_offset_g += row_off_g;
++        pt_offset_b += row_off_b;
++
++        int idx = (blockIdx.y * shard + i) * (wd * 3) + (blockIdx.x * (shard * 3));
++
++        paeth_loop_dec(paeth_r, i, idx, output, wd);
++        paeth_loop_dec(paeth_g, i, idx + 1, output, wd);
++        paeth_loop_dec(paeth_b, i, idx + 2, output, wd);
++
++        __syncthreads();
++    }
++}
++
++
++void preprocess_l3_decode(uint8_t *output, const uint8_t *input, int in_size, void *dev_input, cudaStream_t stream) {
++
++  int wd = ReadWidth(input);
++  int ht = ReadHeight(input);
++  // int shard = (int)ReadShard(input);
++
++  int num_wd = (int)(wd / shard);
++  int num_ht = (int)(ht / shard);
++
++  unsigned short *offset_cpu_in_r, *offset_cpu_in_g, *offset_cpu_in_b;
++  int *offset_cpu_out_r, *offset_cpu_out_g, *offset_cpu_out_b;
++  void *offset_dev_out_r, *offset_dev_out_g, *offset_dev_out_b;
++
++  size_t size_offset = sizeof(short) * num_wd * num_ht;
++  size_t size_offset_int = sizeof(int) * (num_wd * num_ht + 1);
++
++  offset_cpu_in_r = (unsigned short *)malloc(size_offset);
++  offset_cpu_in_g = (unsigned short *)malloc(size_offset);
++  offset_cpu_in_b = (unsigned short *)malloc(size_offset);
++
++  offset_cpu_out_r = (int *)malloc(size_offset_int);
++  offset_cpu_out_g = (int *)malloc(size_offset_int);
++  offset_cpu_out_b = (int *)malloc(size_offset_int);
++
++  cudaMalloc(&offset_dev_out_r, size_offset_int);
++  cudaMalloc(&offset_dev_out_g, size_offset_int);
++  cudaMalloc(&offset_dev_out_b, size_offset_int);
++
++  memcpy((void *)offset_cpu_in_r, (void *)&input[13], size_offset);
++  memcpy((void *)offset_cpu_in_g, (void *)&input[13 + (num_wd * num_ht) * 2], size_offset);
++  memcpy((void *)offset_cpu_in_b, (void *)&input[13 + (num_wd * num_ht) * 4], size_offset);
++
++  offset_cpu_out_r[0] = 0;
++  offset_cpu_out_g[0] = 0;
++  offset_cpu_out_b[0] = 0;
++  for (int i = 0; i < num_wd * num_ht + 1; i++) {
++      offset_cpu_out_r[i + 1] = offset_cpu_in_r[i] + offset_cpu_out_r[i];
++      offset_cpu_out_g[i + 1] = offset_cpu_in_g[i] + offset_cpu_out_g[i];
++      offset_cpu_out_b[i + 1] = offset_cpu_in_b[i] + offset_cpu_out_b[i];
++  }
++
++  free(offset_cpu_in_r);
++  free(offset_cpu_in_g);
++  free(offset_cpu_in_b);
++
++  cudaMemcpyAsync(offset_dev_out_r, (void *)offset_cpu_out_r, size_offset_int, cudaMemcpyHostToDevice, stream);
++  cudaMemcpyAsync(offset_dev_out_g, (void *)offset_cpu_out_g, size_offset_int, cudaMemcpyHostToDevice, stream);
++  cudaMemcpyAsync(offset_dev_out_b, (void *)offset_cpu_out_b, size_offset_int, cudaMemcpyHostToDevice, stream);
++  cudaMemcpyAsync(dev_input, (void *)input, in_size, cudaMemcpyHostToDevice, stream);
++
++  void *dev_out;
++  cudaMalloc(&dev_out, wd * ht * 3);
++
++  dim3 blocks(num_wd, num_ht);
++  dim3 threads(shard, 1);
++
++  decoder<<<blocks, threads, 0, stream>>>((unsigned char *)dev_input,
++                                          (int *)offset_dev_out_r, (int *)offset_dev_out_g, (int *)offset_dev_out_b,
++                                          (unsigned char *)dev_out,
++                                          wd, ht, num_wd, num_ht);
++
++  cudaMemcpyAsync((void *)output, dev_out, wd * ht * 3, cudaMemcpyDeviceToHost, stream);
++  cudaDeviceSynchronize();
++
++  cudaFree(dev_out);
++}
++
++
++}  // namespace dali
++
+diff --git a/dali/operators/decoder/nvjpeg/l3_decoder.h b/dali/operators/decoder/nvjpeg/l3_decoder.h
+new file mode 100644
+index 00000000..b13ebeb0
+--- /dev/null
++++ b/dali/operators/decoder/nvjpeg/l3_decoder.h
+@@ -0,0 +1,19 @@
++
++#ifndef DALI_OPERATORS_DECODER_NVJPEG_L3_DECODER_H_
++#define DALI_OPERATORS_DECODER_NVJPEG_L3_DECODER_H_
++
++#include <cuda_runtime.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++#define shard 64
++
++namespace dali {
++
++void preprocess_l3_decode(uint8_t *output, const uint8_t *input, int in_size, void *dev_input, cudaStream_t stream);
++
++}  // namespace dali
++
++#endif  // DALI_OPERATORS_DECODER_NVJPEG_L3_DECODER_H_
++
+diff --git a/dali/operators/decoder/nvjpeg/nvjpeg_decoder_decoupled_api.h b/dali/operators/decoder/nvjpeg/nvjpeg_decoder_decoupled_api.h
+index 3df0233f..525c0568 100644
+--- a/dali/operators/decoder/nvjpeg/nvjpeg_decoder_decoupled_api.h
++++ b/dali/operators/decoder/nvjpeg/nvjpeg_decoder_decoupled_api.h
+@@ -37,6 +37,10 @@
+ #include "dali/core/dev_buffer.h"
+ #include "dali/operators/decoder/nvjpeg/permute_layout.h"
+ 
++#include "dali/operators/decoder/nvjpeg/l3_decoder.h"
++
++#define L3THREAD 32
++
+ namespace dali {
+ 
+ using ImageInfo = EncodedImageInfo<int>;
+@@ -61,6 +65,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     device_buffers_(num_threads_),
+     streams_(num_threads_),
+     decode_events_(num_threads_),
++    l3_streams_(L3THREAD),
++    l3_decode_events_(L3THREAD),
++    l3_dev_alloc_(L3THREAD),
+     thread_page_ids_(num_threads_),
+     device_id_(spec.GetArgument<int>("device_id")),
+     device_allocator_(nvjpeg_memory::GetDeviceAllocator()),
+@@ -68,6 +75,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     thread_pool_(num_threads_,
+                  spec.GetArgument<int>("device_id"),
+                  spec.GetArgument<bool>("affine") /* pin threads */),
++    l3_thread_(1,
++               spec.GetArgument<int>("device_id"),
++               spec.GetArgument<bool>("affine") /* pin threads */),
+     nvjpeg2k_thread_(1,
+                      spec.GetArgument<int>("device_id"),
+                      spec.GetArgument<bool>("affine")) {
+@@ -158,6 +168,10 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+       CUDA_CALL(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
+                                              default_cuda_stream_priority_));
+     }
++    for (auto &stream : l3_streams_) {
++      CUDA_CALL(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
++                                             default_cuda_stream_priority_));
++    }
+     CUDA_CALL(cudaStreamCreateWithPriority(
+       &hw_decode_stream_, cudaStreamNonBlocking, default_cuda_stream_priority_));
+ 
+@@ -166,6 +180,15 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+       CUDA_CALL(cudaEventRecord(event, streams_[0]));
+     }
+ 
++    for (auto &event : l3_decode_events_) {
++      CUDA_CALL(cudaEventCreate(&event));
++      CUDA_CALL(cudaEventRecord(event, l3_streams_[0]));
++    }
++
++    for (auto &devPtr : l3_dev_alloc_) {
++      CUDA_CALL(cudaMalloc(&devPtr, 2 * 1024 * 1024));
++    }
++
+     CUDA_CALL(cudaEventCreate(&hw_decode_event_));
+     CUDA_CALL(cudaEventRecord(hw_decode_event_, hw_decode_stream_));
+ 
+@@ -225,6 +248,10 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+         CUDA_CALL(cudaStreamSynchronize(stream));
+       }
+ 
++      for (auto &stream : l3_streams_) {
++        CUDA_CALL(cudaStreamSynchronize(stream));
++      }
++
+       for (auto &stream  : jpeg_streams_) {
+         NVJPEG_CALL(nvjpegJpegStreamDestroy(stream));
+       }
+@@ -239,8 +266,20 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+       for (auto &event : decode_events_) {
+         CUDA_CALL(cudaEventDestroy(event));
+       }
++      for (auto &event : l3_decode_events_) {
++        CUDA_CALL(cudaEventDestroy(event));
++      }
++
+       CUDA_CALL(cudaEventDestroy(hw_decode_event_));
+ 
++      for (auto &stream : l3_streams_) {
++        CUDA_CALL(cudaStreamDestroy(stream));
++      }
++
++      for (auto &devPtr : l3_dev_alloc_) {
++        CUDA_CALL(cudaFree(devPtr));
++      }
++
+       for (auto &stream : streams_) {
+         CUDA_CALL(cudaStreamDestroy(stream));
+       }
+@@ -295,6 +334,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     Nvjpeg2k,
+ #endif  // NVJPEG2K_ENABLED
+     Cache,
++    L3Cuda,
+   };
+ 
+   struct DecoderData {
+@@ -362,6 +402,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+   std::vector<SampleData*> samples_hw_batched_;
+   std::vector<SampleData*> samples_single_;
+   std::vector<SampleData*> samples_jpeg2k_;
++  std::vector<SampleData*> samples_l3_;
+ 
+   nvjpegJpegState_t state_hw_batched_ = nullptr;
+ 
+@@ -480,6 +521,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+ #if NVJPEG2K_ENABLED
+     samples_jpeg2k_.clear();
+ #endif  // NVJPEG2K_ENABLED
++    samples_l3_.clear();
+ 
+     for (int i = 0; i < curr_batch_size; i++) {
+       const auto &in = ws.Input<CPUBackend>(0, i);
+@@ -537,10 +579,17 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+         }
+       } else if (crop_generator || !ParseNvjpeg2k(data, span<const uint8_t>(input_data, in_size))) {
+         try {
+-          data.method = DecodeMethod::Host;
+           auto image = ImageFactory::CreateImage(input_data, in_size, output_image_type_);
+           data.shape = image->PeekShape();
+-          samples_host_.push_back(&data);
++          auto ret = (input_data[0] == 'L') && (input_data[1] == 'L') && (input_data[2] == 'L') && (input_data[3] == '.');
++
++          if (ret) {
++            data.method = DecodeMethod::L3Cuda;
++            samples_l3_.push_back(&data);
++          } else {
++            data.method = DecodeMethod::Host;
++            samples_host_.push_back(&data);
++          }
+         } catch (const std::runtime_error &e) {
+           DALI_FAIL(e.what() + ". File: " + data.file_name);
+         }
+@@ -608,6 +657,24 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     }
+   }
+ 
++  void ProcessImagesL3Cuda(MixedWorkspace &ws) {
++    l3_thread_.AddWork([this, &ws](int) {
++      auto &output = ws.OutputRef<GPUBackend>(0);
++      auto &input = ws.InputRef<CPUBackend>(0);
++      int s_id = 0;
++      for (auto *sample : samples_l3_) {
++        assert(sample);
++        auto i = sample->sample_idx;
++        auto *output_data = output.mutable_tensor<uint8_t>(i);
++        ImageCache::ImageShape shape = output_shape_[i].to_static<3>();
++        preprocess_l3_decode(output_data, input[i].data<uint8_t>(), input[i].size(),
++                             l3_dev_alloc_[s_id], l3_streams_[s_id]);
++        CacheStore(sample->file_name, output_data, shape, l3_streams_[s_id]);
++	s_id++;
++      }
++    });  // FIFO order, since the samples were already ordered
++  }
++
+ #if NVJPEG2K_ENABLED
+   void DecodeJpeg2k(uint8_t* output_data, const SampleData *sample,
+                     span<const uint8_t> input_data) {
+@@ -754,20 +821,30 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     ProcessImagesCache(ws);
+ 
+     ProcessImagesCuda(ws);
++    ProcessImagesL3Cuda(ws);
+     ProcessImagesHost(ws);
+     ProcessImagesJpeg2k(ws);
+     thread_pool_.RunAll(false);  // don't block
+     nvjpeg2k_thread_.RunAll(false);
++    l3_thread_.RunAll(false);
+ 
+     ProcessImagesHw(ws);
+ 
+     thread_pool_.WaitForWork();
+     nvjpeg2k_thread_.WaitForWork();
++    l3_thread_.WaitForWork();
++
+     // wait for all work in workspace main stream
+     for (int tid = 0; tid < num_threads_; tid++) {
+       CUDA_CALL(cudaEventRecord(decode_events_[tid], streams_[tid]));
+       CUDA_CALL(cudaStreamWaitEvent(ws.stream(), decode_events_[tid], 0));
+     }
++
++    for (int tid = 0; tid < L3THREAD; tid++) {
++      CUDA_CALL(cudaEventRecord(l3_decode_events_[tid], l3_streams_[tid]));
++      CUDA_CALL(cudaStreamWaitEvent(ws.stream(), l3_decode_events_[tid], 0));
++    }
++
+     CUDA_CALL(cudaEventRecord(hw_decode_event_, hw_decode_stream_));
+     CUDA_CALL(cudaStreamWaitEvent(ws.stream(), hw_decode_event_, 0));
+ #if NVJPEG2K_ENABLED
+@@ -782,6 +859,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+     return 2*thread_id + page;
+   }
+ 
++
+   // Per sample worker called in a thread of the thread pool.
+   // It decodes the encoded image `input_data` (host mem) into `output_data` (device mem) with
+   // nvJPEG. If nvJPEG can't handle the image, it falls back to CPU decoder implementation
+@@ -890,8 +968,11 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+   // Per thread
+   std::vector<nvjpegBufferDevice_t> device_buffers_;
+   std::vector<cudaStream_t> streams_;
+-  cudaStream_t hw_decode_stream_;
+   std::vector<cudaEvent_t> decode_events_;
++  std::vector<cudaStream_t> l3_streams_;
++  std::vector<cudaEvent_t> l3_decode_events_;
++  std::vector<void *> l3_dev_alloc_;
++  cudaStream_t hw_decode_stream_;
+   cudaEvent_t hw_decode_event_;
+   std::vector<int> thread_page_ids_;  // page index for double-buffering
+ 
+@@ -911,6 +992,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
+   nvjpegPinnedAllocator_t pinned_allocator_;
+ 
+   ThreadPool thread_pool_;
++  ThreadPool l3_thread_;
+   ThreadPool nvjpeg2k_thread_;
+   static constexpr int kOutputDim = 3;
+ 
+diff --git a/dali/operators/reader/loader/utils.h b/dali/operators/reader/loader/utils.h
+index 21e9f2dc..d46d00d0 100644
+--- a/dali/operators/reader/loader/utils.h
++++ b/dali/operators/reader/loader/utils.h
+@@ -27,7 +27,7 @@ namespace dali {
+  */
+ static const std::vector<std::string> kKnownImageExtensions = {".jpg", ".jpeg", ".png", ".bmp",
+                                                                ".tif", ".tiff", ".pnm", ".ppm",
+-                                                               ".pgm", ".pbm", ".jp2"};
++                                                               ".pgm", ".pbm", ".jp2", ".l3"};
+ 
+ static const std::vector<std::string> kKnownAudioExtensions = {".flac", ".ogg", ".wav"};
+ 
