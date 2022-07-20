@@ -1,6 +1,6 @@
-# Accelerator-Friendly Lossless Image Format for High-Resolution, High-Throughput DNN Training
+# L3: Accelerator-Friendly Lossless Image Format for High-Resolution, High-Throughput DNN Training
 
-This is the repository for source code of "L3: Accelerator-Friendly Lossless Image Format for High-Resolution, High-Throughput DNN Training".
+This is the source code repository for L3, an accelerator-friendly lossless image format.
 
 The source code consists of independent encoder, decoder module, header file, and patch file for NVIDIA DALI.
 
@@ -70,7 +70,7 @@ $ patch -p1 < ${L3 directory}/src/nvidia-dali/l3-integrated-dali.patch
 ## Citation
 Please cite the following paper if you use L3:
 
-**L3: Accelerator-Friendly Lossless Image Format for High-Resolution, High-Throughput DNN Training.** Jonghyun Bae, Woohyeon Baek, Tae Jun Ham, and Jae W. Lee. In _European Conference on Computer Vision_, October 2022.
+**L3: Accelerator-Friendly Lossless Image Format for High-Resolution, High-Throughput DNN Training.** Jonghyun Bae, Woohyeon Baek, Tae Jun Ham, and Jae W. Lee. In _European Conference on Computer Vision (ECCV)_, October 2022.
 
 ~~~
 @inproceedings {XXXXXX,
